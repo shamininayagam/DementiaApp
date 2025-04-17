@@ -7,25 +7,43 @@ import librosa
 import joblib
 import pickle
 from werkzeug.utils import secure_filename
+import logging
+import traceback
+import socket
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+def find_available_port(start_port=5000, max_port=5010):
+    """Find an available port in the given range."""
+    for port in range(start_port, max_port + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError("No available ports found")
 
 # Model loading function with robust error handling
 def load_model(model_path):
     if not os.path.exists(model_path):
-        print(f"Model file not found: {model_path}")
+        logger.error(f"Model file not found: {model_path}")
         return None
     
     try:
         # Try joblib first
         return joblib.load(model_path)
     except Exception as joblib_error:
-        print(f"Joblib loading failed for {model_path}: {joblib_error}")
+        logger.error(f"Joblib loading failed for {model_path}: {joblib_error}")
         
         try:
             # Fallback to pickle
             with open(model_path, 'rb') as f:
                 return pickle.load(f)
         except Exception as pickle_error:
-            print(f"Pickle loading failed for {model_path}: {pickle_error}")
+            logger.error(f"Pickle loading failed for {model_path}: {pickle_error}")
             return None
 
 # Attempt to load models
@@ -105,22 +123,22 @@ def extract_librosa_features(y):
         return None
 
 @app.route('/predict', methods=['POST'])
-
 def predict_audio():
-    print("/predict")
-    print(request.files)
-    # Explicit try-except block
+    logger.info("Received prediction request")
+    logger.debug(f"Request files: {request.files}")
+    logger.debug(f"Request headers: {request.headers}")
+    
     try:
-        # Model validation
         if loaded_model is None or loaded_scaler is None:
+            logger.error("Model or scaler not loaded")
             return jsonify({
                 'error': 'Model not loaded. Check model files.',
                 'status': 'error',
                 'details': 'Model or scaler could not be loaded'
             }), 500
 
-        # File handling
         if 'file' not in request.files:
+            logger.error("No file in request")
             return jsonify({
                 'error': 'No file uploaded',
                 'status': 'error'
@@ -128,6 +146,7 @@ def predict_audio():
 
         file = request.files['file']
         if file.filename == '':
+            logger.error("Empty filename")
             return jsonify({
                 'error': 'No selected file',
                 'status': 'error'
@@ -136,29 +155,31 @@ def predict_audio():
         # Save file
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        logger.info(f"Saving file to: {filepath}")
         file.save(filepath)
 
-        # Additional nested try-except for detailed error handling
         try:
-            # Preprocessing
+            logger.info("Starting audio preprocessing")
             y = preprocess_audio(filepath)
             if y is None:
+                logger.error("Audio preprocessing failed")
                 os.remove(filepath)
                 return jsonify({
                     'error': 'Audio preprocessing failed',
                     'status': 'error'
                 }), 400
 
-            # Feature extraction
+            logger.info("Starting feature extraction")
             features = extract_librosa_features(y)
             if features is None:
+                logger.error("Feature extraction failed")
                 os.remove(filepath)
                 return jsonify({
                     'error': 'Feature extraction failed',
                     'status': 'error'
                 }), 400
 
-            # Prediction
+            logger.info("Starting prediction")
             features = features.reshape(1, -1)
             features = loaded_scaler.transform(features)
             prediction = loaded_model.predict(features)
@@ -170,7 +191,8 @@ def predict_audio():
             # Map prediction
             class_names = {0: 'AD (Alzheimer\'s Disease)', 1: 'CN (Cognitively Normal)'}
             predicted_class = class_names.get(prediction[0], 'Unknown')
-
+            
+            logger.info(f"Prediction successful: {predicted_class}")
             return jsonify({
                 'prediction': int(prediction[0]),
                 'class_name': predicted_class,
@@ -182,29 +204,23 @@ def predict_audio():
             })
 
         except Exception as process_error:
-            # Ensure file is removed in case of processing error
+            logger.error(f"Processing error: {process_error}")
+            logger.error(traceback.format_exc())
             if os.path.exists(filepath):
                 os.remove(filepath)
-            
-            # Log the full error
-            print(f"Processing error: {process_error}")
-            print(f"Error details: {sys.exc_info()}")
-            
             return jsonify({
                 'error': f'Audio processing error: {str(process_error)}',
                 'status': 'error',
-                'details': str(sys.exc_info())
+                'details': traceback.format_exc()
             }), 500
 
     except Exception as main_error:
-        # Catch any unexpected errors in the main route handler
-        print(f"Unexpected error in prediction route: {main_error}")
-        print(f"Error details: {sys.exc_info()}")
-        
+        logger.error(f"Unexpected error in prediction route: {main_error}")
+        logger.error(traceback.format_exc())
         return jsonify({
             'error': 'Unexpected error during prediction',
             'status': 'error',
-            'details': str(main_error)
+            'details': traceback.format_exc()
         }), 500
 
 @app.route('/', methods=['GET'])
@@ -235,10 +251,20 @@ def internal_error(error):
     }), 500
 
 if __name__ == '__main__':
-    # Print model loading status
-    if loaded_model is None:
-        print("WARNING: No model could be loaded. Check your model files.")
-    if loaded_scaler is None:
-        print("WARNING: No scaler could be loaded. Check your scaler files.")
-    
-    app.run(debug=True,port=5000)
+    try:
+        if loaded_model is None:
+            logger.warning("WARNING: No model could be loaded. Check your model files.")
+        if loaded_scaler is None:
+            logger.warning("WARNING: No scaler could be loaded. Check your scaler files.")
+        
+        port = 5000
+        logger.info(f"Starting server on port {port}")
+        
+        with open('flask_port.txt', 'w') as f:
+            f.write(str(port))
+        
+        app.run(debug=False, port=port, host='127.0.0.1', threaded=True)
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
